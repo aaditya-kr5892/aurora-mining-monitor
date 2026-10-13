@@ -25,6 +25,10 @@ app.add_middleware(
 os.makedirs("outputs", exist_ok=True)
 app.mount("/static", StaticFiles(directory="outputs"), name="static")
 
+@app.get("/")
+def health_check():
+    return {"status": "ok", "message": "Mining Detection API is running"}
+
 # --- Data Models ---
 class GeoJSON(BaseModel):
     type: str

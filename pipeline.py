@@ -16,10 +16,21 @@ PIPELINE_PROGRESS = {
 # t0 = time.time()
 
 def init_ee():
-    credentials = service_account.Credentials.from_service_account_file(
-        "key.json",  # Make sure key.json is in the root mining_app folder
-        scopes=["https://www.googleapis.com/auth/earthengine"]
-    )   
+    gee_json = os.getenv("GEE_KEY_JSON")
+    if gee_json:
+        key_info = json.loads(gee_json)
+        credentials = service_account.Credentials.from_service_account_info(
+            key_info,
+            scopes=["https://www.googleapis.com/auth/earthengine"]
+        )
+    else:
+        key_path = os.getenv("GEE_KEY_PATH", "key.json")
+        if not os.path.exists(key_path) and os.path.exists("/etc/secrets/key.json"):
+            key_path = "/etc/secrets/key.json"
+        credentials = service_account.Credentials.from_service_account_file(
+            key_path,
+            scopes=["https://www.googleapis.com/auth/earthengine"]
+        )
     ee.Initialize(credentials)
 
 

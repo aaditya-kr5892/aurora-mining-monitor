@@ -6,3 +6,6 @@ __pycache__/
 .DS_Store
 key.json
 example outputs/*.json
+venv/
+outputs/
+output.json

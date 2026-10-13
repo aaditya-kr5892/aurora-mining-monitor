@@ -1,4 +1,9 @@
-const API_URL = "http://127.0.0.1:8000";
+// Set your deployed Render URL below once you deploy the backend
+const PRODUCTION_API_URL = "https://YOUR-RENDER-SERVICE-NAME.onrender.com";
+
+const API_URL = (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1")
+    ? "http://127.0.0.1:8000"
+    : PRODUCTION_API_URL;
 const MINE_IMAGE_BASE = `${API_URL}/static/`; 
 let currentPredictions = { legal: 0, nogo: 0 };
 let map;
