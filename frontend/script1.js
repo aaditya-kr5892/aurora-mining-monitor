@@ -1,5 +1,5 @@
 // Set your deployed Render URL below once you deploy the backend
-const PRODUCTION_API_URL = "https://YOUR-RENDER-SERVICE-NAME.onrender.com";
+const PRODUCTION_API_URL = "https://aurora-mining-monitor.onrender.com";
 
 const API_URL = (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1")
     ? "http://127.0.0.1:8000"
