@@ -52,6 +52,8 @@ function checkReady() {
 if(runBtn) {
     runBtn.addEventListener("click", () => {
         switchScreen("loaderScreen");
+        const loaderSubtext = document.querySelector(".subtext");
+        if (loaderSubtext) loaderSubtext.innerText = "Submitting boundaries to backend...";
 
         fetch(`${API_URL}/run`, {
             method: "POST",
@@ -61,35 +63,61 @@ if(runBtn) {
                 no_go_geojson_list: [nogoGeoJSON]
             })
         })
-        .then(res => {
-            if (res.ok) startPolling();
-            else alert("Server Error");
+        .then(async res => {
+            if (res.ok) {
+                startPolling();
+            } else {
+                const errData = await res.json().catch(() => ({}));
+                const msg = errData.detail || errData.message || "Failed to start analysis";
+                alert(`Error: ${msg}`);
+                switchScreen("uploadScreen");
+            }
         })
         .catch(err => {
-            console.error(err);
-            alert("Failed to connect to backend");
+            console.error("Connection error:", err);
+            alert("Failed to connect to backend server. Make sure the backend is running.");
             switchScreen("uploadScreen");
         });
     });
 }
 
 function startPolling() {
+    let pollAttempts = 0;
+    const maxPollAttempts = 600; // 10 minutes maximum
+
     const interval = setInterval(() => {
+        pollAttempts++;
+        if (pollAttempts > maxPollAttempts) {
+            clearInterval(interval);
+            alert("Analysis request timed out. Please check backend logs.");
+            switchScreen("uploadScreen");
+            return;
+        }
+
         fetch(`${API_URL}/progress`)
             .then(res => res.json())
             .then(data => {
-                const p = data.progress;
+                const p = data.progress || 0;
                 document.getElementById("progressFill").style.width = p + "%";
                 document.getElementById("progressPercent").innerText = p + "%";
+
+                if (data.stage) {
+                    const subtextElem = document.querySelector(".subtext");
+                    if (subtextElem) subtextElem.innerText = data.stage;
+                }
 
                 if (data.status === "done") {
                     clearInterval(interval);
                     loadResults();
-                } else if (data.status === "error") {
+                } else if (data.status === "error" || data.status === "failed") {
                     clearInterval(interval);
-                    alert("Analysis Failed. Check server terminal.");
+                    const errorMsg = data.error || "Analysis failed. Please check server logs.";
+                    alert(`Analysis Failed:\n${errorMsg}`);
                     switchScreen("uploadScreen");
                 }
+            })
+            .catch(err => {
+                console.error("Polling error:", err);
             });
     }, 1000);
 }

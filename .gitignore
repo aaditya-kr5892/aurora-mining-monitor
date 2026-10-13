@@ -9,3 +9,6 @@ example outputs/*.json
 venv/
 outputs/
 output.json
+scratch_*.py
+area_legal.geojson
+area_nogo.geojson

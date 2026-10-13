@@ -1,9 +1,9 @@
 import uvicorn
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import os
 
 # Import your pipeline logic
@@ -30,43 +30,44 @@ def health_check():
     return {"status": "ok", "message": "Mining Detection API is running"}
 
 # --- Data Models ---
-class GeoJSON(BaseModel):
-    type: str
-    features: list
-
 class PipelineRequest(BaseModel):
-    mine_geojson: GeoJSON
-    no_go_geojson_list: Optional[List[GeoJSON]] = None
+    mine_geojson: Dict[str, Any]
+    no_go_geojson_list: Optional[List[Dict[str, Any]]] = None
 
 # --- Global Result Store ---
-# Since pipeline returns the result, we need a place to store it
-# so the /results endpoint can pick it up.
 ANALYSIS_RESULT = {}
 
 def background_wrapper(mine_data, nogo_data):
     """Wrapper to capture the return value of your pipeline"""
     global ANALYSIS_RESULT
     try:
-        # Run your logic
         result = run_pipeline(mine_data, nogo_data)
         ANALYSIS_RESULT = result
     except Exception as e:
         print(f"Background Task Error: {e}")
-        # Error handling is managed inside pipeline.py's global PROGRESS variable
+        # Error handling is managed inside pipeline.py's global PIPELINE_PROGRESS variable
 
-@app.post("/run")
+@app.post("/run", status_code=status.HTTP_202_ACCEPTED)
 def run(req: PipelineRequest, background_tasks: BackgroundTasks):
     global ANALYSIS_RESULT
+
+    # Prevent overlapping analysis runs
+    if PIPELINE_PROGRESS.get("status") == "running":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An analysis is currently in progress. Please wait for it to complete."
+        )
+
     ANALYSIS_RESULT = {} # Clear previous results
     
-    # Extract dicts just like your original code
-    mine_dict = req.mine_geojson.dict()
-    nogo_list = [g.dict() for g in req.no_go_geojson_list] if req.no_go_geojson_list else None
+    # Extract dicts directly without Pydantic deprecation warnings
+    mine_dict = req.mine_geojson
+    nogo_list = req.no_go_geojson_list if req.no_go_geojson_list else None
     
     # Run in background so we don't block the progress bar
     background_tasks.add_task(background_wrapper, mine_dict, nogo_list)
     
-    return {"status": "started"}
+    return {"status": "started", "message": "Analysis successfully accepted and started"}
 
 @app.get("/progress")
 def get_progress():

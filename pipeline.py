@@ -9,6 +9,7 @@ import requests
 # Global variable to track progress for the frontend
 PIPELINE_PROGRESS = {
     "status": "idle",
+    "stage": "Ready",
     "progress": 0,
     "error": None
 }
@@ -37,8 +38,104 @@ def init_ee():
 def km2(area_m2):
     return area_m2.divide(1e6)
 
+
+def extract_geometry(geojson_data):
+    """
+    Extracts a standard geometry dictionary from FeatureCollection, Feature,
+    Polygon, or MultiPolygon. Ignores non-geometry metadata (such as @circle).
+    """
+    if not isinstance(geojson_data, dict):
+        raise ValueError("GeoJSON must be a valid JSON object/dictionary")
+    
+    geo_type = geojson_data.get("type")
+    if not geo_type:
+        raise ValueError("GeoJSON input is missing required 'type' field")
+    
+    if geo_type == "FeatureCollection":
+        features = geojson_data.get("features")
+        if not features or not isinstance(features, list):
+            raise ValueError("FeatureCollection must contain a non-empty 'features' list")
+        
+        geometries = []
+        for idx, feat in enumerate(features):
+            if not isinstance(feat, dict):
+                raise ValueError(f"Feature at index {idx} is invalid")
+            geom = feat.get("geometry")
+            if not geom or not isinstance(geom, dict):
+                raise ValueError(f"Feature at index {idx} is missing a valid 'geometry' object")
+            geometries.append(geom)
+            
+        if len(geometries) == 1:
+            return geometries[0]
+        else:
+            all_polys = []
+            for g in geometries:
+                g_type = g.get("type")
+                if g_type == "Polygon":
+                    all_polys.append(g["coordinates"])
+                elif g_type == "MultiPolygon":
+                    all_polys.extend(g["coordinates"])
+                else:
+                    raise ValueError(f"FeatureCollection contains unsupported geometry type '{g_type}'")
+            return {"type": "MultiPolygon", "coordinates": all_polys}
+
+    elif geo_type == "Feature":
+        geom = geojson_data.get("geometry")
+        if not geom or not isinstance(geom, dict):
+            raise ValueError("Feature is missing a valid 'geometry' object")
+        return geom
+
+    elif geo_type in ["Polygon", "MultiPolygon"]:
+        return geojson_data
+
+    elif geo_type in ["Point", "MultiPoint", "LineString", "MultiLineString"]:
+        raise ValueError(
+            f"Unsupported geometry type '{geo_type}'. A Polygon or MultiPolygon boundary is required."
+        )
+    else:
+        raise ValueError(f"Unrecognized GeoJSON type: '{geo_type}'")
+
+
+def validate_coordinates(coords, ring_name="ring"):
+    if not coords or len(coords) < 4:
+        raise ValueError(f"Polygon {ring_name} must contain at least 4 coordinates")
+    first, last = coords[0], coords[-1]
+    if len(first) < 2 or len(last) < 2:
+        raise ValueError(f"Coordinates in {ring_name} must contain at least [longitude, latitude]")
+    if first[0] != last[0] or first[1] != last[1]:
+        raise ValueError(
+            f"Polygon {ring_name} is not closed: start coordinate {first} does not match end coordinate {last}"
+        )
+    for pt in coords:
+        lon, lat = pt[0], pt[1]
+        if not (-180.0 <= lon <= 180.0) or not (-90.0 <= lat <= 90.0):
+            raise ValueError(
+                f"Coordinate [{lon}, {lat}] is out of bounds: longitude must be in [-180, 180], latitude in [-90, 90]"
+            )
+
+
+def validate_geometry(geom):
+    g_type = geom.get("type")
+    coords = geom.get("coordinates")
+    if not coords or not isinstance(coords, list):
+        raise ValueError(f"Geometry '{g_type}' is missing valid coordinates array")
+    
+    if g_type == "Polygon":
+        for i, ring in enumerate(coords):
+            validate_coordinates(ring, f"ring {i}")
+    elif g_type == "MultiPolygon":
+        for p_idx, poly in enumerate(coords):
+            for r_idx, ring in enumerate(poly):
+                validate_coordinates(ring, f"polygon {p_idx} ring {r_idx}")
+    else:
+        raise ValueError(f"Expected Polygon or MultiPolygon, got '{g_type}'")
+    return geom
+
+
 def geojson_to_ee(geojson_dict):
-    return ee.Geometry(geojson_dict["features"][0]["geometry"])
+    clean_geom = extract_geometry(geojson_dict)
+    validate_geometry(clean_geom)
+    return ee.Geometry(clean_geom)
 
 def mask_s2_clouds(img):
     qa = img.select("QA60")
@@ -89,18 +186,22 @@ def export_png(
     bands=None,
     min=0,
     max=0.3, 
-    dimensions=512
+    dimensions=512,
+    region=None
 ):
     """
     Exports an EE Image (single or RGB) as PNG
     """
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
+    if region is None:
+        region = geom.bounds().getInfo()["coordinates"]
+
     params = {
         "min": min,
         "max": max,
         "dimensions": dimensions,
-        "region": geom.bounds().getInfo()["coordinates"],
+        "region": region,
         "format": "png"
     }
 
@@ -109,12 +210,12 @@ def export_png(
 
     try:
         url = image.clip(geom).getThumbURL(params)
-        r = requests.get(url)
+        r = requests.get(url, timeout=30)
         r.raise_for_status()
         with open(out_path, "wb") as f:
             f.write(r.content)
     except Exception as e:
-        print(f"Error exporting {out_path}: {e}")
+        print(f"Warning: Map export skipped for {out_path}: {e}")
 
 
 
@@ -171,11 +272,12 @@ def get_monthly_s2_rgb(year, month, geom):
     )
 
 
-def run_detection(geom, valid_keys, monthly_cache, threshold_cache, out_id="", generate_maps=True):
+def run_detection(geom, valid_keys, monthly_cache, threshold_cache, out_id="", generate_maps=True, chunk_size=4):
     """
     Optimized detection run.
     Uses pre-computed threshold_cache.
-    Batches area calculations to avoid getInfo() inside the loop.
+    Batches area calculations in chunks to prevent 'Too many concurrent aggregations'.
+    Handles missing optical or SAR sensor thresholds gracefully.
     """
     rows = []
     masks_raw = {}
@@ -186,17 +288,19 @@ def run_detection(geom, valid_keys, monthly_cache, threshold_cache, out_id="", g
     prev_change = None
     cum_mask = None
     
+    # Pre-compute region boundary once to avoid repeated getInfo network calls
+    region_coords = geom.bounds().getInfo()["coordinates"] if generate_maps else None
+
     # Temporary list to store server-side area numbers for batch resolution
     area_promises = []
 
     for y, m in valid_keys:
+        date_key = f"{y}-{m:02d}-01"
 
         # Cache is unclipped, so we clip here for local analysis
         s2_idx = monthly_cache[(y, m)]["s2_idx"].clip(geom)
         s2_rgb = monthly_cache[(y, m)]["s2_rgb"].clip(geom)
         s1     = monthly_cache[(y, m)]["s1"].clip(geom)
-
-        # No empty check needed here; valid_keys guarantees data exists.
 
         if prev_s2 is None or prev_s1 is None:
             prev_s2, prev_s1 = s2_idx, s1
@@ -206,23 +310,26 @@ def run_detection(geom, valid_keys, monthly_cache, threshold_cache, out_id="", g
         d_s2 = s2_idx.subtract(prev_s2).pow(2).reduce("sum").sqrt()
         d_s1 = s1.subtract(prev_s1).abs().reduce("sum")
 
-        # ---------- OPTIMIZATION: Use Pre-Computed Thresholds ----------
-        # Thresholds are global (derived from mine) and pre-calculated.
-        # We wrap the cached raw number in an Image.constant for comparison.
-        opt_val = threshold_cache[(y, m)]["opt"]
-        sar_val = threshold_cache[(y, m)]["sar"]
-        
-        opt_thresh_img = ee.Image.constant(opt_val)
-        sar_thresh_img = ee.Image.constant(sar_val)
+        thresh_entry = threshold_cache.get((y, m), {})
+        opt_val = thresh_entry.get("opt")
+        sar_val = thresh_entry.get("sar")
 
-        candidate = d_s2.gt(opt_thresh_img).Or(
-            d_s1.gt(sar_thresh_img)
-        )
+        # Multi-sensor fusion with fallback when one sensor is unavailable / cloud-covered
+        conditions = []
+        if opt_val is not None:
+            conditions.append(d_s2.gt(ee.Image.constant(opt_val)))
+        if sar_val is not None:
+            conditions.append(d_s1.gt(ee.Image.constant(sar_val)))
+
+        if len(conditions) == 2:
+            candidate = conditions[0].Or(conditions[1])
+        elif len(conditions) == 1:
+            candidate = conditions[0]
+        else:
+            candidate = ee.Image.constant(0)
 
         stable = candidate if prev_change is None else candidate.And(prev_change)
         cum_mask = stable if cum_mask is None else cum_mask.Or(stable)
-
-        date_key = f"{y}-{m:02d}-01"
 
         if generate_maps:
             masks_raw[date_key] = cum_mask.rename("mine_mask")
@@ -235,7 +342,8 @@ def run_detection(geom, valid_keys, monthly_cache, threshold_cache, out_id="", g
             png_path = f"outputs/{out_id}/{date_key}.png"
             export_png(
                 viz_rgb, geom, png_path,
-                bands=["B4", "B3", "B2"], min=0, max=0.3
+                bands=["B4", "B3", "B2"], min=0, max=0.3,
+                region=region_coords
             )
 
             quantified_maps[date_key] = png_path.replace("outputs", "/static")
@@ -251,26 +359,27 @@ def run_detection(geom, valid_keys, monthly_cache, threshold_cache, out_id="", g
             ).get("mine_mask")
         )
 
-        # Optimization: Do NOT call getInfo() here. Store the EE object.
-        # We default to 0 if area is null (handled in batch resolution usually, 
-        # but safely assumed 0 if mask is empty).
         area_ee = ee.Algorithms.If(area, ee.Number(area).divide(1e6), 0.0)
         
         rows.append({
             "date": date_key,
-            # Placeholder for value
             "area_km2": 0.0
         })
         area_promises.append(area_ee)
 
         prev_s2, prev_s1, prev_change = s2_idx, s1, candidate
 
-    # ---------- RESOLVE BATCHED AREAS ----------
-    # Single network call to resolve all areas for this zone
+    # ---------- RESOLVE BATCHED AREAS IN CHUNKS ----------
+    # Chunking resolves aggregations safely without tripping GEE concurrency limits
     if area_promises:
-        resolved_areas = ee.List(area_promises).getInfo()
+        resolved_areas = []
+        for i in range(0, len(area_promises), chunk_size):
+            chunk = area_promises[i:i + chunk_size]
+            res_chunk = ee.List(chunk).getInfo()
+            resolved_areas.extend(res_chunk)
+
         for i, val in enumerate(resolved_areas):
-            rows[i]["area_km2"] = val
+            rows[i]["area_km2"] = val if val is not None else 0.0
 
     return {
         "timeseries": rows,
@@ -325,51 +434,56 @@ def classify_alert(area_km2, zone_area_km2):
 # ---------- CORE PIPELINE ----------
 def run_pipeline(mine_geojson, no_go_geojson_list=None):
     global PIPELINE_PROGRESS
-    PIPELINE_PROGRESS["status"] = "running"
-    PIPELINE_PROGRESS["progress"] = 10
+    PIPELINE_PROGRESS.update({
+        "status": "running",
+        "stage": "Validating input boundaries...",
+        "progress": 5,
+        "error": None
+    })
     try:
         t0 = time.time()
-        PIPELINE_PROGRESS["status"] = "running"
-        PIPELINE_PROGRESS["progress"] = 0
+        
+        PIPELINE_PROGRESS.update({
+            "stage": "Initializing Google Earth Engine...",
+            "progress": 10
+        })
         init_ee()
-        PIPELINE_PROGRESS["progress"] = 10
+
+        PIPELINE_PROGRESS.update({
+            "stage": "Parsing and validating GeoJSON boundaries...",
+            "progress": 15
+        })
         mine_geom = geojson_to_ee(mine_geojson)
         no_go_geoms = []
         if no_go_geojson_list:
             no_go_geoms = [geojson_to_ee(g) for g in no_go_geojson_list]
         
-        PIPELINE_PROGRESS["progress"] = 20
+        PIPELINE_PROGRESS.update({
+            "stage": "Checking candidate satellite collection dates...",
+            "progress": 25
+        })
         years  = range(2020, 2025)
         months = [1, 3, 5, 7, 9, 11]
-
-        # OPTIMIZATION: Generate candidates list purely in Python
-        # We will filter these efficiently in a batch later
         candidate_months = [(y, m) for y in years for m in months]
-        
-        PIPELINE_PROGRESS["progress"] = 30
 
         # --- STEP 1: POPULATE CACHE & CHECK VALIDITY (BATCHED) ---
         monthly_cache = {}
         valid_keys = []
         
-        # We need to check which candidates actually have data. 
-        # Instead of 1 getInfo per month, we batch the size check.
-        # Create list of images to check
         check_imgs = []
         for y, m in candidate_months:
-            # We use mine_geom to check availability (S2 is consistent regionally)
             check_imgs.append(get_monthly_s2_indices(y, m, mine_geom))
             
-        # Single network call to check all band counts
-        # This replaces get_valid_months loop
+        PIPELINE_PROGRESS.update({
+            "stage": "Filtering clear-sky Sentinel-2 and Sentinel-1 scenes...",
+            "progress": 35
+        })
         band_counts = ee.List([img.bandNames().size() for img in check_imgs]).getInfo()
         
         for i, count in enumerate(band_counts):
             if count > 0:
                 y, m = candidate_months[i]
-                
-                # Fetch full data objects (no cost until getInfo)
-                s2_idx = check_imgs[i] # Already created
+                s2_idx = check_imgs[i]
                 s2_rgb = get_monthly_s2_rgb(y, m, mine_geom)
                 s1     = get_monthly_s1(y, m, mine_geom)
                 
@@ -380,12 +494,14 @@ def run_pipeline(mine_geojson, no_go_geojson_list=None):
                 }
                 valid_keys.append((y, m))
 
-        # --- STEP 2: PRE-COMPUTE THRESHOLDS (BATCHED) ---
-        # We calculate thresholds on the MINE geometry once and reuse them.
+        # --- STEP 2: PRE-COMPUTE THRESHOLDS (BATCHED IN CHUNKS) ---
+        PIPELINE_PROGRESS.update({
+            "stage": "Computing adaptive Change Vector Analysis (CVA) thresholds...",
+            "progress": 45
+        })
         threshold_cache = {}
-        
-        threshold_ops = [] # List to store server-side reduction objects
-        threshold_indices = [] # Keep track of which (y,m) corresponds to which op
+        threshold_ops = []
+        threshold_indices = []
 
         prev_s2 = None
         prev_s1 = None
@@ -398,11 +514,9 @@ def run_pipeline(mine_geojson, no_go_geojson_list=None):
                 prev_s2, prev_s1 = s2, s1
                 continue
             
-            # Change Magnitude on Mine Geometry
             d_s2 = s2.subtract(prev_s2).pow(2).reduce("sum").sqrt()
             d_s1 = s1.subtract(prev_s1).abs().reduce("sum")
 
-            # Define Reducers (Server-side only)
             opt_reducer = d_s2.reduceRegion(
                 ee.Reducer.percentile([85]), mine_geom, 10, maxPixels=1e13
             )
@@ -410,47 +524,66 @@ def run_pipeline(mine_geojson, no_go_geojson_list=None):
                 ee.Reducer.percentile([80]), mine_geom, 10, maxPixels=1e13
             )
             
-            # Store operation for batch execution
+            # Guard against completely cloudy/empty observations
+            opt_val = ee.Algorithms.If(
+                opt_reducer.values().size().gt(0), opt_reducer.values().get(0), None
+            )
+            sar_val = ee.Algorithms.If(
+                sar_reducer.values().size().gt(0), sar_reducer.values().get(0), None
+            )
+
             threshold_ops.append({
-                "opt": opt_reducer.values().get(0),
-                "sar": sar_reducer.values().get(0)
+                "opt": opt_val,
+                "sar": sar_val
             })
             threshold_indices.append((y, m))
 
             prev_s2, prev_s1 = s2, s1
         
-        # Execute all threshold calculations in ONE network call
+        # Chunked network resolution to prevent "Too many concurrent aggregations"
+        CHUNK_SIZE = 4
         if threshold_ops:
-            threshold_results = ee.List(threshold_ops).getInfo()
-            
-            # Unpack results into cache
-            for idx, res in enumerate(threshold_results):
-                y, m = threshold_indices[idx]
-                threshold_cache[(y, m)] = res
+            for i in range(0, len(threshold_ops), CHUNK_SIZE):
+                chunk = threshold_ops[i:i + CHUNK_SIZE]
+                threshold_results = ee.List(chunk).getInfo()
+                for idx, res in enumerate(threshold_results):
+                    y, m = threshold_indices[i + idx]
+                    threshold_cache[(y, m)] = res
 
-        PIPELINE_PROGRESS["progress"] = 50
+        PIPELINE_PROGRESS.update({
+            "stage": "Running mining excavation detection on legal mine zone...",
+            "progress": 60
+        })
 
         # --- STEP 3: RUN DETECTION (Optimized) ---
         mine_out = run_detection(
             mine_geom, valid_keys, monthly_cache, threshold_cache, 
-            out_id="mine", generate_maps=True
+            out_id="mine", generate_maps=True, chunk_size=CHUNK_SIZE
         )
         
-        PIPELINE_PROGRESS["progress"] = 60
+        PIPELINE_PROGRESS.update({
+            "stage": "Running compliance detection on No-Go zones...",
+            "progress": 75
+        })
         no_go_outs = []
         total_zones = len(no_go_geoms)
         
         if total_zones == 0:
-            PIPELINE_PROGRESS["progress"] = 80
+            PIPELINE_PROGRESS["progress"] = 85
         else:
             for i, zg in enumerate(no_go_geoms):
                 no_go_outs.append(
                     run_detection(
                         zg, valid_keys, monthly_cache, threshold_cache, 
-                        out_id=f"no_go_zone_{i}", generate_maps=False
+                        out_id=f"no_go_zone_{i}", generate_maps=False, chunk_size=CHUNK_SIZE
                     )
                 )
-                PIPELINE_PROGRESS["progress"] = 60 + int(20 * (i + 1) / total_zones)
+                PIPELINE_PROGRESS["progress"] = 75 + int(15 * (i + 1) / total_zones)
+
+        PIPELINE_PROGRESS.update({
+            "stage": "Compiling metrics, violation logs, and trend predictions...",
+            "progress": 90
+        })
 
         mine_ts = mine_out["timeseries"]
         mine_area_total = (
@@ -509,12 +642,16 @@ def run_pipeline(mine_geojson, no_go_geojson_list=None):
                 "analysis_end": out["analysis_end"]
             }
 
-
         mine_ts = sorted(mine_ts, key=lambda x: x["date"])
-        PIPELINE_PROGRESS["progress"] = 90
         print("Runtime:", time.time() - t0)
-        PIPELINE_PROGRESS["status"] = "done"
-        PIPELINE_PROGRESS["progress"] = 100
+        
+        PIPELINE_PROGRESS.update({
+            "status": "done",
+            "stage": "Analysis completed successfully",
+            "progress": 100,
+            "error": None
+        })
+
         results = {
             "metadata": {
                 "analysis_start": mine_out["analysis_start"],
@@ -539,10 +676,12 @@ def run_pipeline(mine_geojson, no_go_geojson_list=None):
             print(f"✅ Output successfully saved to {os.path.abspath(output_path)}")
         except Exception as e:
             print(f"❌ Failed to save output.json: {e}")
-        # -----------------------------------------------
 
         return results
     except Exception as e:
-        PIPELINE_PROGRESS["status"] = "error"
-        PIPELINE_PROGRESS["error"] = str(e)
+        PIPELINE_PROGRESS.update({
+            "status": "error",
+            "stage": "Failed",
+            "error": str(e)
+        })
         raise e
